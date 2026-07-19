@@ -1,0 +1,25 @@
+# 秘密情報・実行時生成物（絶対にコミットしない）
+.env
+raspi/.env
+*.env
+!*.env.example
+
+# ローカル状態・キャッシュ
+buffer.db
+*.db
+ip_cache.json
+
+# バックアップ・クラッシュダンプ・OSゴミ
+*.bak
+*.stackdump
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 認証/検証で生成される一時ファイル
+cookies.txt

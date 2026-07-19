@@ -1,0 +1,20 @@
+# systemd user unit（root不使用）
+# 配置先: /home/youruser/.config/systemd/user/tapo-collector.service
+# 有効化手順は docs/deploy.md を参照
+
+[Unit]
+Description=Tapo P110M Power Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/youruser/tapo
+ExecStart=/home/youruser/tapo/.venv/bin/python /home/youruser/tapo/collector.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

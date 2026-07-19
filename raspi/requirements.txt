@@ -1,0 +1,4 @@
+tapo
+python-kasa
+python-dotenv
+aiohttp
