@@ -15,6 +15,9 @@ Restart=always
 RestartSec=30
 StandardOutput=journal
 StandardError=journal
+# 標準出力がjournalへのパイプになるとprint()がブロックバッファされ、
+# ログが数KB溜まるまで journalctl に出てこない。行単位で流すために無効化する。
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=default.target
