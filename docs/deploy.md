@@ -132,7 +132,19 @@ python test_devices.py
 
 3台それぞれについて model / fw_ver / current_power(生値・換算値) / today_energy が
 表示されればOK。失敗した場合はそのデバイスのエラー内容を確認する
-（tapoライブラリがP110M(JP)個体に接続できない場合はここで顕在化する）。
+（P110M(JP)個体にローカルAPIで接続できない場合はここで顕在化する）。
+
+`AuthenticationError: Device response did not match our challenge` が出る個体は
+KLAP認証が壊れたファームウェア（FW1.4.3以降で確認）の可能性が高い。その場合は
+Tapoアプリの **マイページ → 音声アシスタント → サードパーティ互換性 を OFF** にして
+TPAPで接続させる（アカウント単位の設定なので全デバイスに影響する）。
+判定材料として、対象デバイスが広告している暗号方式は次で確認できる:
+
+```bash
+python -c "import asyncio,json;from kasa import Discover;\
+d=asyncio.run(Discover.discover_single('192.168.1.100'));\
+print(json.dumps(d._discovery_info['result']['mgt_encrypt_schm']))"
+```
 
 ### 3-2. collector手動起動での動作確認
 
@@ -290,3 +302,113 @@ curl -b cookies.txt "https://example.com/tapo/api/data.php?type=current"
   （明示的なcronは用意していない）
 - 収集用API（`api/power.php` / `api/energy.php`）の `X-API-Key` 認証はフェーズ1のまま変更していない
 - `data.php` はセッション認証のみで `X-API-Key` は不要（ブラウザのAJAX用）
+
+---
+
+# デプロイ手順（フェーズ3: 過去履歴アーカイブ）
+
+収集開始より前の期間を、デバイス本体の粗い統計と Tapo アプリのデータエクスポートから
+復元して `energy_daily` / `energy_monthly` に保管し、ダッシュボードの日別・月別グラフに
+合成表示するための手順。**一度きりの作業**で、collector は関与しない。
+
+## 1. テーブル追加
+
+```bash
+scp server/sql/setup_history.sql vps:~/
+ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf < ~/setup_history.sql'
+```
+
+`energy_daily` / `energy_monthly` が作られる。`tapo_app` の権限は `tapo.*` に対して
+付与済みなので追加のGRANTは不要。
+
+## 2. デバイス本体の統計を吸い出す
+
+デバイスは日別を約3ヶ月・月別を約1年しか保持しない。**早く実行するほど多く残る。**
+
+```bash
+scp scripts/backfill_history.py raspi5:/tmp/
+ssh raspi5 '~/tapo/.venv/bin/python /tmp/backfill_history.py' > backfill.sql
+grep '^--' backfill.sql          # 取得できた行数・範囲を確認する
+scp backfill.sql vps:~/
+ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf -D tapo < ~/backfill.sql'
+```
+
+## 3. Tapo アプリのデータエクスポートを取り込む（任意）
+
+デバイスから削除・再登録すると本体の統計は消える。その前にアプリの
+「データエクスポート」（メールで .xls が2通届く）を取っておけば、そこからも復元できる。
+
+```bash
+pip install xlrd
+python3 scripts/import_tapo_export.py --device plug1 path/to/*.xls > import.sql
+grep '^--' import.sql
+scp import.sql vps:~/
+ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf -D tapo < ~/import.sql'
+```
+
+デバイス由来とエクスポート由来が同じ日付で衝突した場合は**後から流した方が勝つ**
+（どちらも `ON DUPLICATE KEY UPDATE`）。エクスポートの方が古い期間をカバーするので、
+デバイス由来 → エクスポート由来の順に流すと直近が実測値のまま残って都合がよい。
+
+## 4. 確認
+
+```bash
+ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf -D tapo -e "
+  SELECT device_key, source, COUNT(*) n, MIN(\`day\`), MAX(\`day\`) FROM energy_daily GROUP BY device_key, source;
+  SELECT device_key, source, COUNT(*) n, MIN(\`month\`), MAX(\`month\`) FROM energy_monthly GROUP BY device_key, source;"'
+```
+
+ダッシュボードの日別（30日/90日/1年）・月別（12ヶ月/24ヶ月）タブで、復元分が
+半透明のバーとして表示されれば完了。
+
+---
+
+# デプロイ手順（フェーズ4: 電気料金モデル）
+
+プラグの消費電力量を実際の電気代（増分コスト）に換算するための料金表を DB に入れる。
+
+## 1. テーブル追加とシード
+
+```bash
+scp server/sql/setup_tariff.sql vps:~/
+ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf < ~/setup_tariff.sql'
+```
+
+`tariff_base` / `tariff_tier` / `tariff_monthly` / `billing_period` / `house_usage_daily` が作られ、
+東京電力エナジーパートナー 従量電灯B の単価がシードされる。**自分の契約に合わせて必ず確認・修正すること。**
+
+## 2. 検針票が届いたら
+
+毎月2箇所を更新する。ダッシュボードの「電気代」セクションが検算結果を表示するので、
+モデル計算値と実請求額が一致していれば単価が正しく入っている。
+
+```sql
+-- 燃料費調整額は検針票に「当月分」「翌月分」が載るので2行ぶん入る。
+-- 再エネ賦課金の単価は年度（5月検針分〜翌年4月検針分）で変わる。
+INSERT INTO tariff_monthly (ym, fuel_adj_yen_per_kwh, renewable_yen_per_kwh) VALUES
+    ('2026-09-01', -12.34, 4.18)
+ON DUPLICATE KEY UPDATE fuel_adj_yen_per_kwh = VALUES(fuel_adj_yen_per_kwh),
+                        renewable_yen_per_kwh = VALUES(renewable_yen_per_kwh);
+
+-- 使用期間・使用量・請求予定金額・次回検針予定日を検針票から転記する（値は書式の例）
+INSERT INTO billing_period (ym, period_start, period_end, kwh, amount_yen, ampere, next_reading_date) VALUES
+    ('2026-09-01', '2026-08-11', '2026-09-09', 400, 13000, 40, '2026-10-10')
+ON DUPLICATE KEY UPDATE period_start = VALUES(period_start), period_end = VALUES(period_end),
+                        kwh = VALUES(kwh), amount_yen = VALUES(amount_yen), ampere = VALUES(ampere),
+                        next_reading_date = VALUES(next_reading_date);
+```
+
+## 3. 確認
+
+```bash
+curl -b cookies.txt "https://example.com/tapo/api/data.php?type=cost"
+```
+
+`bill_yen`（モデル計算）と `actual_yen`（検針票）が一致すればOK。ずれる場合は
+`tariff_tier` の段階単価か `tariff_monthly` の燃調・再エネ単価を疑う。
+
+## 4. 家全体の日別使用量（任意・精度向上）
+
+`billing_period` だけでも検針期間単位の増分コストは出せるが、進行中の期間は
+「前期の家全体 − プラグ3台」を1日あたりのベースラインとした推定になる。
+くらしTEPCO web の一括ダウンロードCSVを `house_usage_daily` に入れると実測に置き換わる。
