@@ -23,3 +23,8 @@ venv/
 
 # 認証/検証で生成される一時ファイル
 cookies.txt
+
+# ローカル作業コンテキスト（公開リポジトリには絶対に含めない）
+/CLAUDE.local.md
+/.local_docs/
+/archive/
