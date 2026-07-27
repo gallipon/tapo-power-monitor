@@ -17,7 +17,9 @@ if ($mysqli) {
     $mysqli->close();
 }
 
-// 推定電気代の単価(円/kWh)。Apache の SetEnv TAPO_YEN_PER_KWH で変更可。
+// 推定電気代の単価(円/kWh)のフォールバック。Apache の SetEnv TAPO_YEN_PER_KWH で変更可。
+// 検針票が billing_period に登録されていれば api/data.php が検針期間ごとの限界単価を
+// 返すため、通常この値は使われない（下の YEN_PER_KWH_FALLBACK を参照）。
 // 未設定時は東京(TEPCO従量電灯B 第2段階相当)の目安 36円/kWh。
 $yen_per_kwh = (float)(getenv('TAPO_YEN_PER_KWH') ?: 36);
 ?>
@@ -182,6 +184,15 @@ $yen_per_kwh = (float)(getenv('TAPO_YEN_PER_KWH') ?: 36);
     font-weight: 600;
   }
 
+  /* アーカイブ（粗い履歴）由来のデータが混ざっているときの注記 */
+  .archive-note {
+    margin-top: 8px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+  .archive-note:empty { display: none; }
+
   .chart-card {
     background: var(--surface-1);
     border: 1px solid var(--border);
@@ -284,10 +295,16 @@ $yen_per_kwh = (float)(getenv('TAPO_YEN_PER_KWH') ?: 36);
   </section>
 
   <section>
-    <h2>日別 電力量（30日）</h2>
+    <h2>日別 電力量</h2>
+    <div class="tabs" id="daily-tabs">
+      <button data-days="30" class="active">30日</button>
+      <button data-days="90">90日</button>
+      <button data-days="366">1年</button>
+    </div>
     <div class="chart-card">
       <div id="dailyCostSummary" class="cost-summary"></div>
       <div class="chart-wrap short"><canvas id="dailyChart"></canvas></div>
+      <div id="dailyArchiveNote" class="archive-note"></div>
       <details class="table-toggle">
         <summary>データを表で見る</summary>
         <div class="data-table-scroll">
@@ -296,18 +313,60 @@ $yen_per_kwh = (float)(getenv('TAPO_YEN_PER_KWH') ?: 36);
       </details>
     </div>
   </section>
+
+  <section>
+    <h2>月別 電力量</h2>
+    <div class="tabs" id="monthly-tabs">
+      <button data-months="12" class="active">12ヶ月</button>
+      <button data-months="24">24ヶ月</button>
+    </div>
+    <div class="chart-card">
+      <div id="monthlyCostSummary" class="cost-summary"></div>
+      <div class="chart-wrap short"><canvas id="monthlyChart"></canvas></div>
+      <div id="monthlyArchiveNote" class="archive-note"></div>
+      <details class="table-toggle">
+        <summary>データを表で見る</summary>
+        <div class="data-table-scroll">
+          <table class="data-table" id="monthlyTable"></table>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <section>
+    <h2>電気代（検針期間ごと）</h2>
+    <div class="chart-card">
+      <div id="costSummary" class="cost-summary"></div>
+      <div class="data-table-scroll">
+        <table class="data-table" id="costTable"></table>
+      </div>
+      <div id="costNote" class="archive-note"></div>
+    </div>
+  </section>
 </main>
 
 <footer>Tapo P110M 電力モニター</footer>
 
 <script>
 const DEVICES = <?php echo json_encode($devices, JSON_UNESCAPED_UNICODE); ?>;
-const YEN_PER_KWH = <?php echo json_encode($yen_per_kwh); ?>; // 推定電気代の単価(円/kWh)
+// 単価のフォールバック。検針票が1件も登録されていない場合にのみ使う。
+// 通常は api/data.php が検針期間ごとに算出した限界単価（rate_ref / 各点の yen）を使う。
+const YEN_PER_KWH_FALLBACK = <?php echo json_encode($yen_per_kwh); ?>;
 const OFFLINE_THRESHOLD_MS = 15 * 60 * 1000; // collectorの送信間隔(10分)に余裕を見た閾値
+
+// グラフの右軸(円)に使う代表単価。data.php の rate_ref（＝現在の検針期間の限界単価）で上書きされる。
+// 右軸は左軸(kWh)の定数倍として描くため、点ごとに違う単価は使えず代表値が要る。
+let YEN_PER_KWH = YEN_PER_KWH_FALLBACK;
 
 // kWh を推定電気代(円)に換算。四捨五入した整数円で返す。
 function yen(kwh) { return Math.round(kwh * YEN_PER_KWH); }
 function fmtYen(kwh) { return '¥' + yen(kwh).toLocaleString('ja-JP'); }
+// 円が確定している点はその値を、無ければ代表単価で換算する
+function fmtYenPoint(p, kwh) {
+  return p && p.yen !== null && p.yen !== undefined
+    ? '¥' + Math.round(p.yen).toLocaleString('ja-JP')
+    : fmtYen(kwh);
+}
 
 const PALETTE = {
   light: { plug1: '#2a78d6', plug2: '#008300', plug3: '#e87ba4' },
@@ -768,8 +827,31 @@ async function loadHourly(days) {
   }
 }
 
-/* ---------- 日別 電力量（積み上げ・30日） ---------- */
+/* ---------- 日別 電力量（積み上げ） ----------
+
+   点ごとに src が付く:
+     hourly  … energy_hourly（1分収集の実データを時間別に積んだもの）
+     archive … energy_daily（収集開始前の期間。デバイス本体の日別統計や
+               Tapoアプリのデータエクスポート由来で、粒度が粗い）
+   アーカイブ由来のバーは半透明にして、由来が違うことが一目で分かるようにする。 */
 let dailyChart = null;
+
+/** 'rgba' 化して透過させる（アーカイブ由来のバー用） */
+function fadeColor(hex, alpha) {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  if (!m) return hex;
+  const [r, g, b] = [1, 2, 3].map(i => parseInt(m[i], 16));
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+}
+
+/** アーカイブ由来の点数を数え、注記を出す（0なら空にして非表示） */
+function renderArchiveNote(elementId, series, unitLabel) {
+  let n = 0;
+  Object.keys(series).forEach(k => series[k].forEach(p => { if (p.src !== 'hourly' && p.src !== 'daily') n++; }));
+  document.getElementById(elementId).textContent = n === 0 ? ''
+    : '半透明の' + n + unitLabel + 'は、収集開始前の期間をデバイス本体の統計やTapoアプリの'
+      + 'データエクスポートから復元した値です（元データの粒度が粗く、実測との誤差が数%あります）。';
+}
 
 function renderDailyTable(series) {
   const table = document.getElementById('dailyTable');
@@ -781,41 +863,55 @@ function renderDailyTable(series) {
   const dateList = Array.from(dateSet).sort();
 
   const maps = {};
-  keys.forEach(k => { maps[k] = new Map(series[k].map(p => [p.date, p.wh])); });
+  keys.forEach(k => { maps[k] = new Map(series[k].map(p => [p.date, p])); });
 
   let rows = dateList.map(d => {
-    const cells = keys.map(k => '<td>' + (maps[k].has(d) ? (maps[k].get(d) / 1000).toFixed(2) : '-') + '</td>');
+    const cells = keys.map(k => {
+      if (!maps[k].has(d)) return '<td>-</td>';
+      const p = maps[k].get(d);
+      // アーカイブ由来は * を付けて実測と区別できるようにする
+      return '<td>' + (p.wh / 1000).toFixed(2) + (p.src === 'hourly' ? '' : ' *') + '</td>';
+    });
     return '<tr><td>' + fmtMD(d) + '</td>' + cells.join('') + '</tr>';
   }).join('');
 
   table.innerHTML = thead + '<tbody>' + rows + '</tbody>';
 }
 
-async function loadDaily() {
+async function loadDaily(days) {
   try {
-    const res = await fetch('api/data.php?type=daily&days=30');
+    const res = await fetch('api/data.php?type=daily&days=' + days);
     if (!res.ok) throw new Error('http ' + res.status);
     const data = await res.json();
+    if (data.rate_ref) YEN_PER_KWH = data.rate_ref;
 
-    const datasets = Object.keys(data.series).map(key => ({
-      label: deviceName(key),
-      data: data.series[key].map(p => ({ x: toLocalDate(p.date), y: p.wh / 1000 })),
-      backgroundColor: seriesColor(key),
-      borderRadius: 4,
-      borderSkipped: 'bottom',
-      maxBarThickness: 20,
-      stack: 'kwh'
-    }));
+    const datasets = Object.keys(data.series).map(key => {
+      const color = seriesColor(key);
+      return {
+        label: deviceName(key),
+        data: data.series[key].map(p => ({ x: toLocalDate(p.date), y: p.wh / 1000, yen: p.yen })),
+        backgroundColor: data.series[key].map(p => p.src === 'hourly' ? color : fadeColor(color, 0.45)),
+        borderRadius: 4,
+        borderSkipped: 'bottom',
+        maxBarThickness: 20,
+        stack: 'kwh'
+      };
+    });
 
-    // 期間(30日)合計の kWh と推定電気代をサマリー表示する
-    let totalWh = 0;
+    // 期間合計の kWh と電気代。金額は各日が属する検針期間の限界単価で換算済みの値を積む。
+    let totalWh = 0, totalYen = 0, exact = true;
     Object.keys(data.series).forEach(key => {
-      data.series[key].forEach(p => { totalWh += p.wh; });
+      data.series[key].forEach(p => {
+        totalWh += p.wh;
+        if (p.yen === null || p.yen === undefined) { exact = false; } else { totalYen += p.yen; }
+      });
     });
     const totalKwh = totalWh / 1000;
     document.getElementById('dailyCostSummary').textContent =
-      '期間合計: ' + totalKwh.toFixed(1) + ' kWh ／ 推定 ' + fmtYen(totalKwh)
-      + '（' + YEN_PER_KWH + '円/kWh 換算）';
+      '期間合計: ' + totalKwh.toFixed(1) + ' kWh ／ 推定 '
+      + (exact ? '¥' + Math.round(totalYen).toLocaleString('ja-JP') : fmtYen(totalKwh))
+      + (exact ? '（検針期間ごとの限界単価で換算）' : '（' + YEN_PER_KWH + '円/kWh 換算）');
+    renderArchiveNote('dailyArchiveNote', data.series, '日分');
 
     if (dailyChart) {
       dailyChart.data.datasets = datasets;
@@ -834,11 +930,16 @@ async function loadDaily() {
             tooltip: Object.assign(baseTooltip(), {
               callbacks: {
                 title: (items) => items.length ? fmtMD(items[0].raw.x) : '',
-                label: (item) => item.dataset.label + ': ' + item.formattedValue + ' kWh（' + fmtYen(item.parsed.y) + '）',
+                label: (item) => item.dataset.label + ': ' + item.formattedValue + ' kWh（'
+                  + fmtYenPoint(item.raw, item.parsed.y) + '）',
                 // その日の合計(積み上げ全系列)の推定電気代をフッターに出す
                 footer: (items) => {
                   const totalKwh = items.reduce((s, it) => s + (it.parsed.y || 0), 0);
-                  return '合計: ' + totalKwh.toFixed(2) + ' kWh / ' + fmtYen(totalKwh);
+                  const known = items.every(it => it.raw.yen !== null && it.raw.yen !== undefined);
+                  const totalYen = known
+                    ? '¥' + Math.round(items.reduce((s, it) => s + it.raw.yen, 0)).toLocaleString('ja-JP')
+                    : fmtYen(totalKwh);
+                  return '合計: ' + totalKwh.toFixed(2) + ' kWh / ' + totalYen;
                 }
               }
             })
@@ -881,6 +982,231 @@ async function loadDaily() {
   }
 }
 
+/* ---------- 月別 電力量（積み上げ） ----------
+
+   点ごとの src:
+     daily   … 日別データがその月を丸ごと埋めている（実測ベース。進行中の月も含む）
+     archive … energy_monthly（デバイス本体の月別統計 / エクスポート由来）
+     partial … 月の一部しかデータが無く、月次アーカイブも無い（過小評価） */
+let monthlyChart = null;
+
+function fmtYM(dateVal) {
+  const d = toLocalDate(dateVal);
+  return d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0');
+}
+
+function renderMonthlyTable(series) {
+  const table = document.getElementById('monthlyTable');
+  const keys = Object.keys(series);
+  let thead = '<thead><tr><th>月</th>' + keys.map(k => '<th>' + deviceName(k) + ' (kWh)</th>').join('') + '</tr></thead>';
+
+  const monthSet = new Set();
+  keys.forEach(k => series[k].forEach(p => monthSet.add(p.month)));
+  const monthList = Array.from(monthSet).sort();
+
+  const maps = {};
+  keys.forEach(k => { maps[k] = new Map(series[k].map(p => [p.month, p])); });
+
+  const rows = monthList.map(m => {
+    const cells = keys.map(k => {
+      if (!maps[k].has(m)) return '<td>-</td>';
+      const p = maps[k].get(m);
+      return '<td>' + (p.wh / 1000).toFixed(2) + (p.src === 'daily' ? '' : ' *') + '</td>';
+    });
+    return '<tr><td>' + fmtYM(m) + '</td>' + cells.join('') + '</tr>';
+  }).join('');
+
+  table.innerHTML = thead + '<tbody>' + rows + '</tbody>';
+}
+
+async function loadMonthly(months) {
+  try {
+    const res = await fetch('api/data.php?type=monthly&months=' + months);
+    if (!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    if (data.rate_ref) YEN_PER_KWH = data.rate_ref;
+
+    const datasets = Object.keys(data.series).map(key => {
+      const color = seriesColor(key);
+      return {
+        label: deviceName(key),
+        data: data.series[key].map(p => ({ x: toLocalDate(p.month), y: p.wh / 1000, yen: p.yen })),
+        backgroundColor: data.series[key].map(p => p.src === 'daily' ? color : fadeColor(color, 0.45)),
+        borderRadius: 4,
+        borderSkipped: 'bottom',
+        maxBarThickness: 28,
+        stack: 'kwh'
+      };
+    });
+
+    let totalWh = 0, totalYen = 0, exact = true;
+    Object.keys(data.series).forEach(key => {
+      data.series[key].forEach(p => {
+        totalWh += p.wh;
+        if (p.yen === null || p.yen === undefined) { exact = false; } else { totalYen += p.yen; }
+      });
+    });
+    const totalKwh = totalWh / 1000;
+    document.getElementById('monthlyCostSummary').textContent =
+      '期間合計: ' + totalKwh.toFixed(1) + ' kWh ／ 推定 '
+      + (exact ? '¥' + Math.round(totalYen).toLocaleString('ja-JP') : fmtYen(totalKwh))
+      + (exact ? '（検針期間ごとの限界単価で換算）' : '（' + YEN_PER_KWH + '円/kWh 換算）');
+    renderArchiveNote('monthlyArchiveNote', data.series, 'ヶ月分');
+
+    if (monthlyChart) {
+      monthlyChart.data.datasets = datasets;
+      monthlyChart.update();
+    } else {
+      const ctx = document.getElementById('monthlyChart').getContext('2d');
+      monthlyChart = new Chart(ctx, {
+        type: 'bar',
+        data: { datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: baseLegend(),
+            tooltip: Object.assign(baseTooltip(), {
+              callbacks: {
+                title: (items) => items.length ? fmtYM(items[0].raw.x) : '',
+                label: (item) => item.dataset.label + ': ' + item.formattedValue + ' kWh（'
+                  + fmtYenPoint(item.raw, item.parsed.y) + '）',
+                footer: (items) => {
+                  const t = items.reduce((s, it) => s + (it.parsed.y || 0), 0);
+                  const known = items.every(it => it.raw.yen !== null && it.raw.yen !== undefined);
+                  const y = known
+                    ? '¥' + Math.round(items.reduce((s, it) => s + it.raw.yen, 0)).toLocaleString('ja-JP')
+                    : fmtYen(t);
+                  return '合計: ' + t.toFixed(2) + ' kWh / ' + y;
+                }
+              }
+            })
+          },
+          scales: baseScales({
+            x: {
+              type: 'time',
+              time: { unit: 'month' },
+              stacked: true,
+              offset: true,
+              grid: { color: cssVar('--gridline'), drawTicks: false },
+              ticks: { color: cssVar('--text-muted'), maxRotation: 0, autoSkipPadding: 12 }
+            },
+            y: { stacked: true, title: { display: true, text: 'kWh', color: cssVar('--text-muted') } },
+            // 日別グラフと同じく、左軸(kWh)の目盛りをそのまま円に読み替える右軸
+            yYen: {
+              position: 'right',
+              stacked: true,
+              grid: { drawOnChartArea: false },
+              title: { display: true, text: '円', color: cssVar('--text-muted') },
+              afterBuildTicks: (axis) => {
+                const y = axis.chart.scales.y;
+                if (!y) return;
+                axis.min = y.min;
+                axis.max = y.max;
+                axis.ticks = y.ticks.map(t => ({ value: t.value }));
+              },
+              ticks: {
+                color: cssVar('--text-muted'),
+                callback: (v) => '¥' + Math.round(v * YEN_PER_KWH).toLocaleString('ja-JP')
+              }
+            }
+          })
+        }
+      });
+    }
+    renderMonthlyTable(data.series);
+  } catch (e) {
+    console.error('loadMonthly failed', e);
+  }
+}
+
+/* ---------- 電気代（検針期間ごと） ----------
+
+   プラグの電気代は「そのプラグが無かったら請求がいくら減るか」= 増分コスト。
+   段階料金なので単純な kWh × 単価にはならない（詳細は api/data.php を参照）。 */
+
+function fmtYenInt(yen) { return '¥' + Math.round(yen).toLocaleString('ja-JP'); }
+
+function fmtPeriod(p) {
+  const s = toLocalDate(p.start), e = toLocalDate(p.end);
+  return (s.getMonth() + 1) + '/' + s.getDate() + '〜' + (e.getMonth() + 1) + '/' + e.getDate();
+}
+
+function renderCostTable(periods) {
+  const head = '<thead><tr><th>期間</th><th>日数</th><th>家全体<br>(kWh)</th>'
+    + '<th>プラグ3台<br>(kWh)</th><th>占有率</th><th>プラグの<br>電気代</th>'
+    + '<th>限界単価<br>(円/kWh)</th><th>請求額</th></tr></thead>';
+
+  const rows = [];
+  periods.forEach(p => {
+    const label = p.in_progress ? fmtPeriod(p) + '<br><small>進行中 ' + p.elapsed_days + '/' + p.days + '日</small>'
+                                : fmtPeriod(p);
+    // 実請求額があればそれを、無ければモデル計算値を出す（推定は括弧付き）
+    const bill = p.actual_yen !== null ? fmtYenInt(p.actual_yen) : '(' + fmtYenInt(p.bill_yen) + ')';
+    rows.push('<tr><td>' + label + '</td><td>' + p.days + '</td>'
+      + '<td>' + p.house_kwh.toFixed(1) + (p.in_progress ? ' *' : '') + '</td>'
+      + '<td>' + p.plug_kwh.toFixed(2) + '</td>'
+      + '<td>' + (p.plug_share === null ? '-' : p.plug_share.toFixed(1) + '%') + '</td>'
+      + '<td>' + fmtYenInt(p.plug_yen) + '</td>'
+      + '<td>' + (p.marginal_rate === null ? '-' : p.marginal_rate.toFixed(2)) + '</td>'
+      + '<td>' + bill + '</td></tr>');
+
+    if (p.projection) {
+      const j = p.projection;
+      rows.push('<tr><td><small>↑期末見込み</small></td><td>' + p.days + '</td>'
+        + '<td>' + j.house_kwh.toFixed(1) + ' *</td>'
+        + '<td>' + j.plug_kwh.toFixed(2) + '</td>'
+        + '<td>' + (j.house_kwh > 0 ? (j.plug_kwh / j.house_kwh * 100).toFixed(1) + '%' : '-') + '</td>'
+        + '<td>' + fmtYenInt(j.plug_yen) + '</td>'
+        + '<td>' + (j.marginal_rate === null ? '-' : j.marginal_rate.toFixed(2)) + '</td>'
+        + '<td>(' + fmtYenInt(j.bill_yen) + ')</td></tr>');
+    }
+  });
+
+  document.getElementById('costTable').innerHTML = head + '<tbody>' + rows.join('') + '</tbody>';
+}
+
+async function loadCost() {
+  try {
+    const res = await fetch('api/data.php?type=cost');
+    if (!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    const periods = data.periods || [];
+    if (!periods.length) {
+      document.getElementById('costSummary').textContent = '検針票の実績が未登録です（billing_period）。';
+      return;
+    }
+    renderCostTable(periods);
+
+    // 最新期間（進行中があればそれ）のサマリー。進行中は期末見込みを主役にする。
+    const cur = periods[periods.length - 1];
+    const v = cur.projection || cur;
+    const label = cur.in_progress ? '今期の見込み' : '直近の期間';
+    const parts = Object.keys(cur.devices)
+      .map(k => deviceName(k) + ' ' + fmtYenInt(cur.devices[k].yen));
+    document.getElementById('costSummary').innerHTML =
+      '<strong>' + label + '（' + fmtPeriod(cur) + '）</strong>　'
+      + '家全体 ' + v.house_kwh.toFixed(1) + ' kWh ／ 請求 ' + fmtYenInt(v.bill_yen) + '<br>'
+      + 'うちプラグ3台 ' + v.plug_kwh.toFixed(1) + ' kWh = <strong>' + fmtYenInt(v.plug_yen) + '</strong>'
+      + '（限界単価 ' + (v.marginal_rate === null ? '-' : v.marginal_rate.toFixed(2)) + ' 円/kWh）'
+      + (cur.in_progress ? '' : '　内訳: ' + parts.join(' / '));
+
+    // 検針票の実績がある期間について、料金モデルの計算値と一致しているかを出す
+    const checks = periods.filter(p => p.actual_yen !== null)
+      .map(p => fmtPeriod(p) + ': モデル ' + fmtYenInt(p.bill_yen) + ' / 実請求 ' + fmtYenInt(p.actual_yen)
+        + (p.bill_yen === p.actual_yen ? ' → 一致' : ' → 差 ' + fmtYenInt(p.bill_yen - p.actual_yen)));
+    const approx = periods.some(p => !p.rate_exact);
+    document.getElementById('costNote').innerHTML =
+      '* は推定値（家全体の使用量は前期の「家全体 − プラグ3台」を1日あたりのベースラインとして算出）。'
+      + '請求額の括弧付きは料金モデルによる試算。'
+      + (checks.length ? '<br>検算 — ' + checks.join(' ／ ') : '')
+      + (approx ? '<br>燃料費調整・再エネ賦課金の単価が未登録の期間があり、直近の登録値で近似しています。' : '');
+  } catch (e) {
+    console.error('loadCost failed', e);
+  }
+}
+
 /* ---------- タブ切替 ---------- */
 document.getElementById('power-tabs').addEventListener('click', (e) => {
   const btn = e.target.closest('button');
@@ -898,11 +1224,29 @@ document.getElementById('hourly-tabs').addEventListener('click', (e) => {
   loadHourly(Number(btn.dataset.days));
 });
 
+document.getElementById('daily-tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  document.querySelectorAll('#daily-tabs button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadDaily(Number(btn.dataset.days));
+});
+
+document.getElementById('monthly-tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  document.querySelectorAll('#monthly-tabs button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadMonthly(Number(btn.dataset.months));
+});
+
 /* ---------- 初期化 ---------- */
 loadCurrent();
 loadPower(1);
 loadHourly(1);
-loadDaily();
+loadDaily(30);
+loadMonthly(12);
+loadCost();
 
 setInterval(loadCurrent, 30000);
 </script>

@@ -1,4 +1,15 @@
-tapo
-python-kasa
+# python-kasa は TPAP 対応版（未マージPR: python-kasa/python-kasa#1592）を使う。
+# FW1.4.3 以降の P110M は KLAP 認証が壊れており、TPAP でしかローカル接続できない。
+# 本家に取り込まれたら通常の `python-kasa` に戻してよい。
+#
+# 注意: fork のバージョン表記は本家と同じ 0.10.2 なので、`pip install -U python-kasa` を
+# 実行すると黙って本家に置き換わり TPAP が消える。入れ直すときは:
+#   pip install --force-reinstall --no-deps "python-kasa @ <下記URL>"
+python-kasa @ https://github.com/ZeliardM/python-kasa/archive/refs/heads/feature/tpap.zip
+
+# TPAPトランスポートの依存（本家 python-kasa には無いので明示する）
+passlib
+ecdsa
+
 python-dotenv
 aiohttp

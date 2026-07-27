@@ -11,22 +11,20 @@ Tapo P110M 電力データ収集サービス（常駐、asyncio）
 タイムゾーンは Asia/Tokyo(JST) に統一する。SQLiteに保存する ts / hour_start、
 VPSへ送るJSONの日時文字列はすべて JST のnaive文字列 "YYYY-MM-DD HH:MM:SS"。
 
-デバイスへのアクセスは TapoDevice クラスに薄くラップしてある。
-P110M(JP)の一部個体は discovery で Encrypt Type "TPAP" と表示される新しめの
-プロトコルを使っており、`tapo` (PyPI, mihai-dinculescu製) ライブラリでの接続に
-失敗する可能性がある。失敗する場合は TapoDevice の中身だけを python-kasa ベースの
-実装に差し替えれば、呼び出し側(周期ループ・SQLiteバッファ・HTTP送信)には手を
-入れずに済む構造にしてある。
+デバイスへのアクセスは TapoDevice クラスに薄くラップしてある。中身は python-kasa
+実装で、接続のたびに Discover.discover_single() を通すことでデバイスが広告している
+暗号方式(KLAP / TPAP)を自動判別する。FW1.4系のP110Mは「サードパーティ互換性」設定が
+ONならKLAP、OFFならTPAPを広告するが、どちらに転んでも収集側のコードは変わらない。
+(TPAPはFW1.4.3以降のKLAP認証が壊れている個体の唯一の接続手段。詳細はREADME参照)
 
 例外でプロセス全体が落ちないよう、デバイス個別のエラーは全て捕捉して
 ログ出力のみ行い、次周期に再接続を試みる。それでも死んだ場合は
 systemd の Restart=always が最後の砦。
 
 DHCPでプラグのIPが変わっても収集が止まらないよう、接続/取得に失敗した周期でのみ
-python-kasa の Discover.discover() によるLAN discoveryを実行し、MACアドレスで
-現在のIPを特定して ~/tapo/ip_cache.json を更新する（実データ取得は引き続き
-tapoライブラリを使う。discoveryはIP追従専用）。接続が成功している通常時は
-discoveryを一切トリガーしないため、平常運転時のオーバーヘッドはゼロ。
+Discover.discover() によるLANブロードキャストdiscoveryを実行し、MACアドレスで
+現在のIPを特定して ~/tapo/ip_cache.json を更新する。接続が成功している通常時は
+ブロードキャストdiscoveryを一切トリガーしないため、平常運転時のオーバーヘッドはゼロ。
 """
 
 from __future__ import annotations
@@ -45,15 +43,9 @@ import aiohttp
 from dotenv import load_dotenv
 
 try:
-    from tapo import ApiClient
-    from tapo.requests import EnergyDataInterval
+    from kasa import Credentials, Discover
 except ImportError:  # pip install前や導通確認前は未インストールの可能性がある
-    ApiClient = None  # type: ignore[assignment,misc]
-    EnergyDataInterval = None  # type: ignore[assignment,misc]
-
-try:
-    from kasa import Discover  # LAN discovery専用。実データ取得は引き続きtapoライブラリを使う
-except ImportError:  # pip install前は未インストールの可能性がある
+    Credentials = None  # type: ignore[assignment,misc]
     Discover = None  # type: ignore[assignment,misc]
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -72,8 +64,16 @@ DISCOVERY_MIN_INTERVAL_SEC = 60.0  # 前回discoveryからの最低間隔（全�
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
+CONNECT_DISCOVERY_TIMEOUT_SEC = 8  # 個別デバイスへのunicast discovery（connect時）
+
+# get_energy_data の interval は「1区間あたりの分数」。60 = 1時間刻み。
+ENERGY_DATA_INTERVAL_MIN = 60
+
 # 前回discovery実行時刻（time.monotonic()）。モジュールレベルでレート制限を共有する。
 _last_discovery_ts: float = 0.0
+
+# 後始末中のdisconnectタスク。GCで途中キャンセルされないよう完了まで参照を保持する。
+_pending_disconnects: set[asyncio.Task] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +218,18 @@ class TapoDevice:
     """
     P110M への薄いアクセスラッパー。
 
-    現状は `tapo` (mihai-dinculescu製, PyPI: tapo) ライブラリを使う実装。
-    P110M(JP) の一部個体がこのライブラリで接続できない場合は、このクラスの
-    中身だけを python-kasa 実装に差し替える想定（connect/get_*のシグネチャは
-    維持する）。呼び出し側は device_key/ip とこのクラスのpublicメソッドしか知らない。
+    python-kasa 実装。connect() で Discover.discover_single() を通すため、
+    デバイスが広告する暗号方式(KLAP / TPAP)は自動判別される。取得系は
+    modules/update() を経由せず生クエリ(get_energy_usage / get_energy_data)を
+    直接叩く。これは `tapo` ライブラリ実装時と同一のリクエストであり、
+    値の意味・分解能が変わらないことを実機で確認済み(2026-07-25)。
+
+    power_poll_loop と energy_loop は同じインスタンスを共有するため、デバイスへの
+    アクセスは全てロックで直列化する。TPAPのPAKEハンドシェイクは状態を持ち、
+    同時に2本張ると `pake_share failed: INTERNAL_UNKNOWN_ERROR(-100000)` で
+    両方失敗する（KLAPは同時接続を許容していたので旧実装では顕在化しなかった）。
+
+    呼び出し側は device_key/ip とこのクラスのpublicメソッドしか知らない。
     """
 
     def __init__(
@@ -237,7 +245,8 @@ class TapoDevice:
         self.mac = mac  # 正規化済みMAC。Noneならdiscoveryによる追従対象外
         self._email = email
         self._password = password
-        self._device = None  # tapo.PlugEnergyMonitorHandler 相当
+        self._device = None  # kasa.Device
+        self._lock = asyncio.Lock()  # デバイスへのアクセスを直列化する（TPAPのPAKE衝突対策）
 
     @property
     def connected(self) -> bool:
@@ -245,7 +254,10 @@ class TapoDevice:
 
     def reset(self) -> None:
         """接続状態をリセットし、次回アクセス時に再接続させる"""
-        self._device = None
+        device, self._device = self._device, None
+        if device is not None:
+            # 旧デバイスが抱えるHTTPセッションを閉じる（同期メソッドなので投げっぱなしにする）
+            _schedule_disconnect(device)
 
     def update_ip(self, new_ip: str) -> None:
         """discoveryで新IPが判明した際に呼ぶ。接続状態もリセットし次回再接続させる"""
@@ -253,20 +265,57 @@ class TapoDevice:
         self.reset()
 
     async def connect(self) -> None:
-        if ApiClient is None:
-            raise RuntimeError("tapo ライブラリが未インストールです (pip install tapo)")
-        client = ApiClient(self._email, self._password)
-        self._device = await client.p110(self.ip)
+        """
+        未接続なら接続する（接続済みなら何もしない）。
+
+        discover_single() は対象IPへUDP 20002でTDPプローブを打ってから接続するため、
+        (a) 暗号方式(KLAP/TPAP)の自動判別 (b) ローカルAPIを遅延起動する個体の
+        叩き起こし、の両方を兼ねる。
+        """
+        if Discover is None or Credentials is None:
+            raise RuntimeError("python-kasa が未インストールです (pip install -r requirements.txt)")
+
+        async with self._lock:
+            if self._device is not None:
+                return  # ロック待ちの間に他方のループが繋いでいた（二重接続を作らない）
+
+            device = await Discover.discover_single(
+                self.ip,
+                credentials=Credentials(self._email, self._password),
+                discovery_timeout=CONNECT_DISCOVERY_TIMEOUT_SEC,
+            )
+            # ここで初めて認証が走る。失敗すれば例外が飛び、呼び出し側がreset()して次周期に再試行する。
+            # self._device へ入る前に落ちた分は reset() の掃除対象にならないため、この場で閉じる
+            # （認証不能な個体が1台あると毎分HTTPセッションを漏らし続けることになるため）
+            try:
+                await device.update()
+            except BaseException:
+                await _safe_disconnect(device)
+                raise
+            self._device = device
+
+    async def _query(self, method: str, params: dict | None = None) -> dict:
+        """生クエリを1回投げ、method直下のdictを返す"""
+        async with self._lock:
+            device = self._device
+            assert device is not None, "connect() を先に呼んでください"
+            response = await device.protocol.query({method: params or {}})
+        result = response.get(method)
+        if not isinstance(result, dict):
+            raise RuntimeError(f"{method}() のレスポンスが不正です: {response!r}")
+        return result
 
     async def get_device_info(self) -> dict:
         """モデル名・FWバージョン等を dict で返す（test_devices.py 用）"""
-        assert self._device is not None, "connect() を先に呼んでください"
-        info = await self._device.get_device_info()
-        return {
-            "model": getattr(info, "model", "?"),
-            "fw_ver": getattr(info, "fw_ver", "?"),
-            "device_on": getattr(info, "device_on", None),
-        }
+        async with self._lock:
+            device = self._device
+            assert device is not None, "connect() を先に呼んでください"
+            await device.update()
+            return {
+                "model": device.model,
+                "fw_ver": device.device_info.firmware_version,
+                "device_on": device.is_on,
+            }
 
     async def get_current_power_detail(self) -> tuple[int | None, float]:
         """
@@ -277,9 +326,8 @@ class TapoDevice:
           - get_energy_usage().current_power は mW(例: 259186)
         サブワット分解能が取れる get_energy_usage() 側を採用し、1000で割ってWに換算する。
         """
-        assert self._device is not None, "connect() を先に呼んでください"
-        result = await self._device.get_energy_usage()
-        raw_mw = getattr(result, "current_power", None)
+        result = await self._query("get_energy_usage")
+        raw_mw = result.get("current_power")
         if raw_mw is None:
             raise RuntimeError("get_energy_usage() のレスポンスに current_power がありません")
         return raw_mw, raw_mw / 1000.0
@@ -291,42 +339,64 @@ class TapoDevice:
 
     async def get_today_energy_wh(self) -> int | None:
         """導通テスト表示用。get_energy_usage().today_energy (Wh) を返す"""
-        assert self._device is not None, "connect() を先に呼んでください"
-        result = await self._device.get_energy_usage()
-        return getattr(result, "today_energy", None)
+        result = await self._query("get_energy_usage")
+        return result.get("today_energy")
 
     async def get_hourly_energy(self, day: datetime) -> list[HourlyEnergyPoint]:
         """
         指定日(JSTローカル日付)のhourly電力量履歴(Wh)を取得する。
 
-        tapo 0.9.0 のシグネチャは get_energy_data(interval, start_date, end_date=None)。
-        start_date はデバイスローカル(JST想定)のnaive datetimeでよい。
-        返り値 EnergyDataResult の .entries が1時間ごとの EnergyDataIntervalResult 配列で、
-        各要素の .energy が当該1時間のWh。指定日の00:00始まりで24件返る（実機確認済み、
-        FW 1.4.1 / tapo 0.9.0, 2026-07-19）。
+        get_energy_data は start_timestamp / end_timestamp をepoch秒で受け、
+        interval は1区間あたりの分数（60 = 1時間刻み）。レスポンスの data が
+        Wh配列、start_timestamp が1件目の開始時刻。
+
+        実機確認済み(P110M(JP) FW 1.4.1 / python-kasa, 2026-07-25):
+          - 要求した start_timestamp がそのまま echo される（時刻解釈のズレなし）
+          - 指定日の00:00始まりで24件返り、合計が get_energy_usage().today_energy と一致
+          - 既存の energy_hourly（tapoライブラリ収集分）と24時間すべて完全一致
         """
-        assert self._device is not None, "connect() を先に呼んでください"
-        if EnergyDataInterval is None:
-            raise RuntimeError("tapo ライブラリが未インストールです (pip install tapo)")
-
         start = datetime(day.year, day.month, day.day)
+        end = start + timedelta(days=1)
 
-        result = await self._device.get_energy_data(EnergyDataInterval.Hourly, start)
-        entries = getattr(result, "entries", None) or []
-        points: list[HourlyEnergyPoint] = []
-        for i, entry in enumerate(entries):
-            wh = getattr(entry, "energy", 0)
-            points.append(HourlyEnergyPoint(hour_start=start + timedelta(hours=i), wh=int(wh)))
-        return points
+        result = await self._query(
+            "get_energy_data",
+            {
+                "start_timestamp": int(start.timestamp()),
+                "end_timestamp": int(end.timestamp()),
+                "interval": ENERGY_DATA_INTERVAL_MIN,
+            },
+        )
+        entries = result.get("data") or []
+        # デバイスが返した開始時刻を基準にする（要求値と一致するが、ズレた場合はデバイス側を正とする）
+        base_ts = result.get("start_timestamp")
+        base = datetime.fromtimestamp(base_ts) if base_ts else start
+        return [
+            HourlyEnergyPoint(hour_start=base + timedelta(hours=i), wh=int(wh))
+            for i, wh in enumerate(entries)
+        ]
 
 
 # ---------------------------------------------------------------------------
 # LAN discovery によるIP追従（接続失敗時のみ発火。成功パスには一切絡まない）
 # ---------------------------------------------------------------------------
 
+def _schedule_disconnect(device) -> None:
+    """
+    デバイスのHTTPセッションを閉じるタスクを投げる（後始末専用。同期文脈から呼ぶ）。
+    イベントループ外から呼ばれた場合は何もしない（プロセス終了時など）。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_safe_disconnect(device))
+    _pending_disconnects.add(task)
+    task.add_done_callback(_pending_disconnects.discard)
+
+
 async def rediscover_ips(devices: dict[str, TapoDevice]) -> dict[str, str]:
     """
-    python-kasa の Discover.discover() を1回呼び、LAN上で応答した機器の
+    Discover.discover() を1回呼び、LAN上で応答した機器の
     {正規化MAC: IP} を返す。例外時・未インストール時は空dictを返しログのみ出す。
     devices引数は探索対象台数のログ表示にのみ使う（discover()自体はLAN全体をbroadcastする）。
     """
