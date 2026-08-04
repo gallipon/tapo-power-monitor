@@ -412,3 +412,100 @@ curl -b cookies.txt "https://example.com/tapo/api/data.php?type=cost"
 `billing_period` だけでも検針期間単位の増分コストは出せるが、進行中の期間は
 「前期の家全体 − プラグ3台」を1日あたりのベースラインとした推定になる。
 くらしTEPCO web の一括ダウンロードCSVを `house_usage_daily` に入れると実測に置き換わる。
+
+---
+
+# デプロイ手順（フェーズ5: 収集停止のアラート）
+
+collector が止まったこと、あるいは特定のプラグだけ収集できなくなったことを
+ntfy.sh のプッシュ通知で検知する。
+
+## 0. 設計上の前提
+
+- **デバイス単位で判定する。** collector プロセスが生きたまま特定のプラグだけ
+  認証に失敗するケースがあり、プロセスの死活監視では検知できない
+- **閾値はバッチ間隔を十分に上回らせる。** collector は約10分ぶんをバッファして
+  一括送信するため、DB の最新行は正常時でも 0〜10分古い。
+  既定の閾値 30分 はこれに1回ぶんの取りこぼしを足した値
+- **通知は状態遷移時のみ。** 「正常→異常」「異常→復旧」で1回ずつ。
+  閾値超過のたびに投げると停止中は延々と通知が飛ぶ
+
+## 1. 配置
+
+```bash
+scp server/check_collector.php vps:~/tapo-deploy/
+ssh vps
+php -l ~/tapo-deploy/check_collector.php
+sudo cp ~/tapo-deploy/check_collector.php /var/www/html/tapo/
+```
+
+スクリプトは CLI 専用（Web からのアクセスは 403 を返す）。
+
+## 2. 環境変数
+
+Apache の `SetEnv` は CLI には効かないため、cron 用に root only の env ファイルを用意する。
+
+```bash
+sudo tee /etc/tapo-check.env >/dev/null <<'EOF'
+TAPO_DB_HOST="localhost"
+TAPO_DB_USER="tapo_app"
+TAPO_DB_PASS="your_db_password_here"
+TAPO_DB_NAME="tapo"
+TAPO_NTFY_TOPIC="your-unguessable-topic"
+EOF
+sudo chmod 600 /etc/tapo-check.env
+```
+
+`TAPO_NTFY_TOPIC` は **トピック名そのものが認証情報**（ntfy.sh 無料プランのトピックは公開で、
+名前を知っていれば誰でも購読・投稿できる）。UUID 等の推測されない文字列を使い、
+リポジトリにも公開する場所にも書かない。
+
+## 3. cron 登録
+
+```bash
+sudo crontab -e
+```
+
+```
+*/5 * * * * set -a; . /etc/tapo-check.env; set +a; /usr/bin/php /var/www/html/tapo/check_collector.php >> /var/log/tapo_check.log 2>&1
+```
+
+## 4. 動作確認
+
+異常が無ければ何も出力しない（ログが空なのが正常）。
+
+```bash
+# 手動実行（出力なし・終了コード0が正常）
+sudo sh -c 'set -a; . /etc/tapo-check.env; set +a; php /var/www/html/tapo/check_collector.php'
+```
+
+通知経路まで含めて確かめる場合は、**使い捨てのトピックを使って本番の通知先を汚さない**。
+コピーを作って閾値と状態ファイルだけ差し替え、`__DIR__` が壊れないよう
+同じディレクトリに置いて実行する。
+
+```bash
+sudo bash -c '
+SCRATCH="selftest-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d " \n")"
+T=/var/www/html/tapo/.cc_test.php
+trap "rm -f $T /tmp/cc_test_state.json" EXIT
+sed -e "s|ALERT_THRESHOLD_MINUTES = 30|ALERT_THRESHOLD_MINUTES = 1|" \
+    -e "s|/tmp/tapo_collector_state.json|/tmp/cc_test_state.json|" \
+    /var/www/html/tapo/check_collector.php > $T
+set -a; . /etc/tapo-check.env; set +a
+export TAPO_NTFY_TOPIC="$SCRATCH"
+php $T            # 1回目: 全台ダウン判定
+php $T            # 2回目: 再通知しない（出力なしが正）
+sed -i "s|ALERT_THRESHOLD_MINUTES = 1|ALERT_THRESHOLD_MINUTES = 1440|" $T
+php $T            # 3回目: 復帰通知
+sleep 2
+curl -s "https://ntfy.sh/${SCRATCH}/json?poll=1"
+'
+```
+
+## 5. 運用メモ
+
+- 状態ファイルは `/tmp/tapo_collector_state.json`。再起動で消えるが、
+  消えた場合は「異常が続いていれば次回実行で改めて通知される」だけで実害はない
+- 全台同時にダウンした場合はタイトルが「全台停止」になり優先度が `urgent` に上がる
+- ログの時刻は `TAPO_TZ`（既定 `Asia/Tokyo`）で表示する。
+  死活判定自体は MySQL の `NOW()` で行うのでタイムゾーン設定の影響を受けない
