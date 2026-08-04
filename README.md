@@ -18,6 +18,7 @@ Tapo の公式クラウド API は非公開で、消費電力データはアプ�
 - **DHCP でも止まらない IP 自動追従** — 接続失敗時のみ LAN discovery を行い MAC で機器を再特定。通常時はオーバーヘッドゼロ
 - **ネットワーク断への耐性** — 送信失敗時はローカル SQLite にバッファして復旧後に再送(主キーで重複無害化)
 - **認証付きダッシュボード** — パスワードログイン + Remember Me(90日)。スマホ・ダークモード対応
+- **収集停止のプッシュ通知** — デバイス単位でデータの鮮度を監視し、途絶と復帰を ntfy.sh へ通知。プロセスの死活監視では拾えない「一部のプラグだけ収集が止まる」障害を検知する
 
 ## アーキテクチャ
 
@@ -68,6 +69,7 @@ server/                    VPS に配置する PHP アプリ
   index.php                ダッシュボード本体（Chart.js）
   auth.php                 認証ガード（セッション + Remember Me）
   login.php / logout.php   ログイン / ログアウト
+  check_collector.php      収集停止の監視（cron 実行、ntfy.sh へ通知）
   api/
     db_config.php          DB 接続共通関数（getenv ベース）
     power.php              瞬時電力バッチ受信（X-API-Key、INSERT IGNORE）
@@ -144,6 +146,7 @@ docs/
 | `API_KEY` / `TAPO_API_KEY` | raspi `.env` / VPS Apache | 収集 API の共有キー（英数字のみ推奨） |
 | `DEVICES` | raspi `.env` | `device_key:ip:mac` のカンマ区切り |
 | `TAPO_DASH_PASSWORD` | VPS Apache | ダッシュボードのログインパスワード |
+| `TAPO_NTFY_TOPIC` | VPS cron 環境 | 収集停止アラートの送信先 ntfy.sh トピック。**トピック名は事実上のパスワード**（無料プランでは誰でも購読・投稿できる）なので、推測されない文字列にしてリポジトリには含めない |
 | `TAPO_YEN_PER_KWH` | VPS Apache | 電気代の単価(円/kWh)の**フォールバック**。未設定時は 36。検針票が `billing_period` に1件でも入っていれば、料金モデルが算出した検針期間ごとの限界単価が使われるのでこの値は出番がない |
 
 ## ライセンス
