@@ -379,8 +379,32 @@ ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf < ~/setup_tariff.sql'
 
 ## 2. 検針票が届いたら
 
-毎月2箇所を更新する。ダッシュボードの「電気代」セクションが検算結果を表示するので、
-モデル計算値と実請求額が一致していれば単価が正しく入っている。
+毎月2箇所（`tariff_monthly` / `billing_period`）を更新する。ダッシュボードの「電気代」
+セクションが検算結果を表示するので、モデル計算値と実請求額が一致していれば単価が正しい。
+
+### 2-a. 請求書PDFから自動生成する（推奨）
+
+くらしTEPCO web からダウンロードできる「電気料金等請求書」PDF を渡すと SQL を吐く。
+
+```bash
+# 読み取り結果の確認だけ
+python scripts/import_meisai_pdf.py --check ~/Downloads/meisai_*.pdf
+
+# SQL を生成して流す
+python scripts/import_meisai_pdf.py ~/Downloads/meisai_*.pdf > /tmp/billing.sql
+scp /tmp/billing.sql vps:~/ && ssh vps 'sudo mysql --defaults-file=/etc/mysql/debian.cnf tapo < ~/billing.sql && rm ~/billing.sql'
+```
+
+`pdftotext`（poppler-utils）が要る。複数のPDFをまとめて渡してよい。
+
+**読み取りに失敗したら SQL を出さずに終了する。** 内訳の合計が請求金額と一致することを
+確認してから出力するため、書式が変わって取り違えた場合は黙って通らない。
+
+なお燃料費調整は検針票に「当月分」「翌月分」の2つが載るので、1枚から2ヶ月ぶん埋まる。
+前月の検針票の「翌月分」と今月の「当月分」は一致するはずで、
+複数枚まとめて渡すとこのクロスチェックも兼ねられる。
+
+### 2-b. 手で書く場合
 
 ```sql
 -- 燃料費調整額は検針票に「当月分」「翌月分」が載るので2行ぶん入る。
