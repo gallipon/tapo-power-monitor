@@ -84,6 +84,7 @@ server/                    VPS に配置する PHP アプリ
 scripts/
   backfill_history.py      デバイス本体が持つ日別・月別統計を SQL として書き出す
   import_tapo_export.py    Tapo アプリのデータエクスポート(.xls) を SQL に変換する
+  import_meisai_pdf.py     電気料金請求書のPDFを料金モデル用の SQL に変換する
   deploy_vps_prep.sh       VPS 側の下ごしらえ
 
 docs/
