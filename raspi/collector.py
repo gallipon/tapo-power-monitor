@@ -192,6 +192,17 @@ def load_ip_cache() -> dict[str, str]:
     return {}
 
 
+def duplicate_ips(cache: dict[str, str]) -> dict[str, list[str]]:
+    """同じIPを指している device_key が2つ以上あれば {ip: [key, ...]} を返す。
+
+    1つのIPに2台は居られないので、重複は「どちらか（あるいは両方）が間違っている」確証になる。
+    """
+    by_ip: dict[str, list[str]] = {}
+    for key, ip in cache.items():
+        by_ip.setdefault(ip, []).append(key)
+    return {ip: keys for ip, keys in by_ip.items() if len(keys) > 1}
+
+
 def save_ip_cache(cache: dict[str, str]) -> None:
     """device_key -> ip のキャッシュを書き込む（秘密情報ではないのでパーミッションは考慮しない）"""
     try:
@@ -212,6 +223,14 @@ def save_ip_cache(cache: dict[str, str]) -> None:
 class HourlyEnergyPoint:
     hour_start: datetime  # JSTナイーブ
     wh: int
+
+
+class MacMismatchError(RuntimeError):
+    """接続先の実機MACが設定と違った（DHCPでIPが入れ替わった等）。
+
+    接続自体は成功してしまうため、これを失敗として扱わないと
+    「別のプラグの値を自分の値として記録し続ける」事故になる（2026-10-01〜10-11 に発生）。
+    """
 
 
 class TapoDevice:
@@ -289,10 +308,35 @@ class TapoDevice:
             # （認証不能な個体が1台あると毎分HTTPセッションを漏らし続けることになるため）
             try:
                 await device.update()
+                self._verify_mac(device)
             except BaseException:
                 await _safe_disconnect(device)
                 raise
             self._device = device
+
+    def _verify_mac(self, device) -> None:
+        """
+        接続した相手が設定どおりの個体かをMACで確かめる。
+
+        discovery による IP 追従は「接続に失敗したとき」しか走らないため、
+        DHCP の割当が入れ替わって別の個体に繋がってしまうと、接続は成功し続け
+        永遠に追従しない。ここで弾いて失敗扱いにすることで discovery を発火させる。
+        """
+        if self.mac is None:
+            return  # MAC未設定のデバイスは追従対象外（従来通り固定IP運用）
+
+        actual = getattr(device, "mac", None)
+        if not actual:
+            # 個体やライブラリ版によっては取れないことがある。検証できないだけで接続は正常
+            print(f"[mac] {self.device_key}: 接続先のMACを取得できず検証をスキップします")
+            return
+
+        actual_norm = normalize_mac(actual)
+        if actual_norm != self.mac:
+            raise MacMismatchError(
+                f"{self.device_key}: {self.ip} の実機MACが設定と違います "
+                f"(expected={self.mac} actual={actual_norm})。IPが入れ替わった可能性があります"
+            )
 
     async def _query(self, method: str, params: dict | None = None) -> dict:
         """生クエリを1回投げ、method直下のdictを返す"""
@@ -432,12 +476,19 @@ async def _safe_disconnect(kdev) -> None:
         pass  # 後始末に失敗してもプロセスは継続する
 
 
-async def maybe_rediscover_and_update(failed_devices: dict[str, TapoDevice]) -> None:
+async def maybe_rediscover_and_update(
+    failed_devices: dict[str, TapoDevice], all_devices: dict[str, TapoDevice] | None = None
+) -> None:
     """
     接続/取得に失敗したデバイスがある周期でのみ呼ばれるトリガー。
     mac未設定のデバイスはIP追従対象外なのでそもそもdiscoveryの理由にしない。
     レート制限（DISCOVERY_MIN_INTERVAL_SEC）を満たしていれば、失敗デバイス全体で
     discoveryを最大1回だけ実行し、IPが変わっていたデバイスのみ更新してキャッシュへ保存する。
+
+    **IPの反映先は失敗したデバイスだけでなく all_devices 全体にする。**
+    discovery自体はLAN全体へのブロードキャストで、応答した全機器のMAC->IPが一度に得られる。
+    失敗した側だけ直すと、DHCPで2台のIPが入れ替わったときに「成功している側が
+    相手のIPを持ったまま」になり、キャッシュ上でIPが重複する（2026-10-01の事故）。
     """
     global _last_discovery_ts
 
@@ -457,7 +508,13 @@ async def maybe_rediscover_and_update(failed_devices: dict[str, TapoDevice]) -> 
 
     cache = await asyncio.to_thread(load_ip_cache)
     cache_updated = False
-    for key, dev in targets.items():
+    # 反映対象は全デバイス（mac設定済みのものに限る）。省略時は従来どおり失敗分のみ
+    apply_to = {
+        key: dev
+        for key, dev in (all_devices or failed_devices).items()
+        if dev.mac
+    }
+    for key, dev in apply_to.items():
         new_ip = found.get(dev.mac)
         if new_ip is None:
             continue
@@ -466,10 +523,15 @@ async def maybe_rediscover_and_update(failed_devices: dict[str, TapoDevice]) -> 
             dev.update_ip(new_ip)
             cache[key] = new_ip
             cache_updated = True
-        else:
+        elif key in targets:
+            # 失敗していないデバイスまで毎回報告すると、1台のダウンでログが台数分膨らむ
             print(f"[discovery] {key}: IPは変わっていません({dev.ip})。デバイス側の別要因の可能性があります")
 
     if cache_updated:
+        dups = duplicate_ips(cache)
+        if dups:
+            # ここに来るのは discovery の結果が食い違っているとき。MAC検証が次周期で弾く
+            print(f"[ip_cache] 警告: IPが重複しています {dups}")
         await asyncio.to_thread(save_ip_cache, cache)
 
 
@@ -614,7 +676,7 @@ async def power_poll_loop(devices: dict[str, TapoDevice]) -> None:
                 failed[device_key] = dev
         if failed:
             # 接続成功パスはここを一切通らない＝discoveryは失敗時のみ発火する
-            await maybe_rediscover_and_update(failed)
+            await maybe_rediscover_and_update(failed, devices)
         await asyncio.sleep(POWER_POLL_INTERVAL_SEC)
 
 
@@ -664,7 +726,7 @@ async def energy_loop(devices: dict[str, TapoDevice], api_url: str, api_key: str
                     failed[device_key] = dev
 
             if failed:
-                await maybe_rediscover_and_update(failed)
+                await maybe_rediscover_and_update(failed, devices)
 
             if records:
                 ok = await send_energy_batch(session, api_url, api_key, records)
@@ -686,6 +748,13 @@ async def main() -> None:
     await asyncio.to_thread(init_db)
 
     ip_cache = await asyncio.to_thread(load_ip_cache)
+
+    # 重複したIPを持つキーはキャッシュを捨て、.env の ip_hint からやり直す。
+    # 壊れたキャッシュを起点にすると、MAC検証で弾かれるまで1周期ぶん無駄に失敗する
+    for ip, keys in duplicate_ips(ip_cache).items():
+        print(f"[ip_cache] {ip} が {keys} で重複しています。この分のキャッシュを破棄します")
+        for key in keys:
+            ip_cache.pop(key, None)
 
     devices: dict[str, TapoDevice] = {}
     for key, cfg in device_configs.items():
