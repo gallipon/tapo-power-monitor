@@ -229,6 +229,13 @@ $yen_per_kwh = (float)(getenv('TAPO_YEN_PER_KWH') ?: 36);
   }
   .data-table th:first-child, .data-table td:first-child { text-align: left; }
   .data-table-scroll { max-height: 220px; overflow: auto; }
+  /* 枠の中でスクロールしても見出しの行は残す（背景を塗らないと下の行が透ける） */
+  .data-table-scroll thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface-1);
+    z-index: 1;
+  }
 
   footer {
     text-align: center;
@@ -1164,7 +1171,11 @@ function renderCostTable(periods) {
     }
   });
 
-  document.getElementById('costTable').innerHTML = head + '<tbody>' + rows.join('') + '</tbody>';
+  const table = document.getElementById('costTable');
+  table.innerHTML = head + '<tbody>' + rows.join('') + '</tbody>';
+  // 古い順に並べているので、枠の中は最下部（最新の期間）を見せた状態から始める
+  const box = table.closest('.data-table-scroll');
+  if (box) box.scrollTop = box.scrollHeight;
 }
 
 async function loadCost() {

@@ -100,12 +100,19 @@ def breakdown_amounts(lines: list[str]) -> list[Decimal]:
 
     「(うち消費税等相当額 1,099円)」のような括弧内・「うち」を含む行は
     内訳の再掲であって加算対象ではないので除外する。
+
+    「合計（10％対象）」の行も範囲に含める。金額が1行ずれるため、月によっては
+    最後の内訳（再エネ発電賦課金の額）がこの行に乗る（2026年11月分, 205kWh で実測）。
+    この行に請求金額そのものが出る書式に変わった場合は、合計の検証で止まる。
     """
     start = end = None
     for i, ln in enumerate(lines):
         if start is None and "基本料金" in ln:
             start = i
-        elif start is not None and ("合計" in ln or "託送料金" in ln):
+        elif start is not None and "合計" in ln:
+            end = i + 1
+            break
+        elif start is not None and "託送料金" in ln:
             end = i
             break
     if start is None:

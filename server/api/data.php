@@ -532,15 +532,70 @@ function tapo_base_charge(mysqli $mysqli, ?int $ampere, string $onDate): float {
 }
 
 /**
+ * 検針期間 [$start, $end] を料金改定日で区切り、区間ごとの単価と日数の重みを返す。
+ * [{w, tiers, base}, ...]（w の合計は 1）。
+ *
+ * 期間の途中で単価が変わると、検針票は基本料金も段階料金も日数で按分して計算する
+ * （2026-11-01 の改定で実測: 10/13〜11/10 の 40A 基本料金
+ *  1,247.00×19/29 + 1,568.24×10/29 = 1,357.77 が検針票と一致）。
+ * 段階料金は「使用量も段階の境界も日数で按分する」方式で、これは区間ごとに
+ * 期間全体の使用量で段階料金を出して重みを掛けるのと同じ値になる。
+ */
+function tapo_tariff_segments(mysqli $mysqli, ?int $ampere, string $start, string $end): array {
+    $stmt = $mysqli->prepare(
+        'SELECT valid_from FROM tariff_tier WHERE valid_from > ? AND valid_from <= ?
+         UNION
+         SELECT valid_from FROM tariff_base WHERE ampere = ? AND valid_from > ? AND valid_from <= ?
+         ORDER BY valid_from'
+    );
+    $amp = $ampere ?? 0;
+    $stmt->bind_param('ssiss', $start, $end, $amp, $start, $end);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $bounds = [$start];
+    while ($row = $res->fetch_assoc()) {
+        $bounds[] = $row['valid_from'];
+    }
+    $stmt->close();
+
+    $total = (int)round((strtotime($end) - strtotime($start)) / 86400) + 1;
+    $segs = [];
+    foreach ($bounds as $i => $from) {
+        $next = $bounds[$i + 1] ?? date('Y-m-d', strtotime($end . ' +1 day'));
+        $days = (int)round((strtotime($next) - strtotime($from)) / 86400);
+        $segs[] = [
+            'w'     => $total > 0 ? $days / $total : 1.0,
+            'tiers' => tapo_tiers($mysqli, $from),
+            'base'  => tapo_base_charge($mysqli, $ampere, $from),
+        ];
+    }
+    return $segs;
+}
+
+/** 区間の重みを掛けた段階料金の合計 */
+function tapo_seg_tier_charge(array $segs, float $kwh): float {
+    $sum = 0.0;
+    foreach ($segs as $s) {
+        $sum += $s['w'] * tapo_tier_charge($s['tiers'], $kwh);
+    }
+    return $sum;
+}
+
+/**
  * 家全体 $houseKwh のときの請求額と、そのうちプラグ $plugKwh 分の増分コストを返す。
  * 再エネ発電賦課金は検針票にならって円未満切り捨て、請求額も最後に切り捨てる。
+ * $segs は tapo_tariff_segments() の戻り値。
  */
-function tapo_calc_cost(array $tiers, array $rate, float $base, float $houseKwh, float $plugKwh): array {
-    $tierCharge = tapo_tier_charge($tiers, $houseKwh);
+function tapo_calc_cost(array $segs, array $rate, float $houseKwh, float $plugKwh): array {
+    $base = 0.0;
+    foreach ($segs as $s) {
+        $base += $s['w'] * $s['base'];
+    }
+    $tierCharge = tapo_seg_tier_charge($segs, $houseKwh);
     $fuel = $houseKwh * $rate['fuel'];
     $renew = floor($houseKwh * $rate['renew']);
 
-    $tierDelta = $tierCharge - tapo_tier_charge($tiers, max(0.0, $houseKwh - $plugKwh));
+    $tierDelta = $tierCharge - tapo_seg_tier_charge($segs, max(0.0, $houseKwh - $plugKwh));
     $incremental = $tierDelta + $plugKwh * ($rate['fuel'] + $rate['renew']);
 
     return [
@@ -615,12 +670,11 @@ function tapo_cost_periods(mysqli $mysqli): array {
         $days = (int)round((strtotime($p['end']) - strtotime($p['start'])) / 86400) + 1;
         $elapsed = (int)round((strtotime($to) - strtotime($p['start'])) / 86400) + 1;
 
-        $tiers = tapo_tiers($mysqli, $p['end']);
+        $segs = tapo_tariff_segments($mysqli, $p['ampere'], $p['start'], $p['end']);
         $rate = tapo_variable_rate($mysqli, $p['ym']);
-        $base = tapo_base_charge($mysqli, $p['ampere'], $p['end']);
 
         $houseKwh = $p['progress'] ? $p['baseline'] * $elapsed + $plugTotal : $p['house_kwh'];
-        $now = tapo_calc_cost($tiers, $rate, $base, $houseKwh, $plugTotal);
+        $now = tapo_calc_cost($segs, $rate, $houseKwh, $plugTotal);
 
         // 増分コストのデバイス按分。段階跨ぎを個別に切り分ける自然な方法が無いため
         // 消費量比で割り振る（合計は増分コストと一致する）。
@@ -656,7 +710,7 @@ function tapo_cost_periods(mysqli $mysqli): array {
         if ($p['progress'] && $elapsed > 0 && $days > $elapsed) {
             $plugProj = $plugTotal / $elapsed * $days;
             $houseProj = $p['baseline'] * $days + $plugProj;
-            $proj = tapo_calc_cost($tiers, $rate, $base, $houseProj, $plugProj);
+            $proj = tapo_calc_cost($segs, $rate, $houseProj, $plugProj);
             $row['projection'] = [
                 'house_kwh'     => round($houseProj, 1),
                 'plug_kwh'      => round($plugProj, 2),
