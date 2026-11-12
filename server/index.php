@@ -229,6 +229,13 @@ $yen_per_kwh = (float)(getenv('TAPO_YEN_PER_KWH') ?: 36);
   }
   .data-table th:first-child, .data-table td:first-child { text-align: left; }
   .data-table-scroll { max-height: 220px; overflow: auto; }
+  /* 枠の中でスクロールしても見出しの行は残す（背景を塗らないと下の行が透ける） */
+  .data-table-scroll thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface-1);
+    z-index: 1;
+  }
 
   footer {
     text-align: center;
