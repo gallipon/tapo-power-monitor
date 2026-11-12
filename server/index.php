@@ -1164,7 +1164,11 @@ function renderCostTable(periods) {
     }
   });
 
-  document.getElementById('costTable').innerHTML = head + '<tbody>' + rows.join('') + '</tbody>';
+  const table = document.getElementById('costTable');
+  table.innerHTML = head + '<tbody>' + rows.join('') + '</tbody>';
+  // 古い順に並べているので、枠の中は最下部（最新の期間）を見せた状態から始める
+  const box = table.closest('.data-table-scroll');
+  if (box) box.scrollTop = box.scrollHeight;
 }
 
 async function loadCost() {
